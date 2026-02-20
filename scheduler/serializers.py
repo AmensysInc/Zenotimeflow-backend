@@ -22,18 +22,58 @@ class OrganizationSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
+class CompanyManagerSerializer(serializers.ModelSerializer):
+    """Nested manager details for company/manager window."""
+    full_name = serializers.SerializerMethodField()
+
+    def get_full_name(self, obj):
+        if not obj:
+            return None
+        return f"{obj.first_name or ''} {obj.last_name or ''}".strip() or obj.email
+
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'first_name', 'last_name', 'full_name', 'is_active']
+
+
 class CompanySerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(source='organization.name', read_only=True)
     company_manager_email = serializers.EmailField(source='company_manager.email', read_only=True)
     operations_manager_email = serializers.EmailField(source='operations_manager.email', read_only=True)
-    
+    company_manager_details = serializers.SerializerMethodField()
+    employees_count = serializers.SerializerMethodField()
+    employees_preview = serializers.SerializerMethodField()
+
+    def get_company_manager_details(self, obj):
+        """Full manager details for the manager window (id, email, name)."""
+        if not obj.company_manager_id:
+            return None
+        try:
+            return CompanyManagerSerializer(obj.company_manager).data
+        except Exception:
+            return None
+
+    def get_employees_count(self, obj):
+        """A company can have any number of employees."""
+        return obj.employees.count() if hasattr(obj, 'employees') else 0
+
+    def get_employees_preview(self, obj):
+        """List of employees in this company (supports multiple employees per company)."""
+        if not hasattr(obj, 'employees'):
+            return []
+        return [
+            {'id': str(e.id), 'full_name': e.full_name, 'email': e.email, 'status': e.status}
+            for e in obj.employees.all()[:50]
+        ]
+
     class Meta:
         model = Company
         fields = [
             'id', 'name', 'type', 'field_type', 'color', 'address',
             'phone', 'email', 'organization', 'organization_name',
-            'company_manager', 'company_manager_email',
+            'company_manager', 'company_manager_email', 'company_manager_details',
             'operations_manager', 'operations_manager_email',
+            'employees_count', 'employees_preview',
             'created_by', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -63,23 +103,71 @@ class ScheduleTeamSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
+class EmployeeUserSerializer(serializers.ModelSerializer):
+    """Minimal user info nested in Employee response; single source of truth in User table."""
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'is_active', 'first_name', 'last_name']
+
+
 class EmployeeSerializer(serializers.ModelSerializer):
+    """
+    Employee in dedicated table; linked to User (OneToOne) and Company.
+    Employees are stored in the employees table; company can be set on create or assigned later via PATCH.
+    """
     full_name = serializers.CharField(read_only=True)
     company_name = serializers.CharField(source='company.name', read_only=True)
     department_name = serializers.CharField(source='department.name', read_only=True)
     team_name = serializers.CharField(source='team.name', read_only=True)
     user_email = serializers.EmailField(source='user.email', read_only=True)
-    
+    user_info = serializers.SerializerMethodField()
+    # Accept company_id from client (maps to company FK)
+    company_id = serializers.UUIDField(required=False, allow_null=True, write_only=True)
+
+    def get_user_info(self, obj):
+        """Nested user info for Employee Management UI; User table remains source of truth."""
+        if not obj.user_id:
+            return None
+        return EmployeeUserSerializer(obj.user).data
+
     class Meta:
         model = Employee
         fields = [
-            'id', 'user', 'user_email', 'first_name', 'last_name', 'full_name',
+            'id', 'user', 'user_email', 'user_info', 'first_name', 'last_name', 'full_name',
             'email', 'phone', 'hire_date', 'hourly_rate', 'position', 'status',
-            'company', 'company_name', 'department', 'department_name',
+            'company', 'company_id', 'company_name', 'department', 'department_name',
             'team', 'team_name', 'employee_pin', 'emergency_contact_name',
             'emergency_contact_phone', 'notes', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'full_name', 'created_at', 'updated_at']
+        extra_kwargs = {'company': {'required': False, 'allow_null': True}}
+
+    def validate_company(self, value):
+        """Company must exist when provided."""
+        if value is not None:
+            from .models import Company
+            if not Company.objects.filter(id=value.id).exists():
+                raise serializers.ValidationError('Company not found.')
+        return value
+
+    def validate(self, attrs):
+        """Map company_id to company; prevent duplicate Employee per User."""
+        # Allow client to send company_id instead of (or in addition to) company
+        company_id = attrs.pop('company_id', None)
+        if company_id is not None:
+            from .models import Company
+            try:
+                attrs['company'] = Company.objects.get(id=company_id)
+            except Company.DoesNotExist:
+                raise serializers.ValidationError({'company_id': 'Company not found.'})
+
+        # Employee must be stored in employees table; one record per user
+        if not self.instance and attrs.get('user'):
+            if Employee.objects.filter(user=attrs['user']).exists():
+                raise serializers.ValidationError(
+                    {'user': 'This user already has an employee record. One user can have only one employee profile.'}
+                )
+        return attrs
 
 
 class ShiftSerializer(serializers.ModelSerializer):

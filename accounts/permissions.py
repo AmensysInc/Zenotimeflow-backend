@@ -2,6 +2,54 @@ from rest_framework import permissions
 from .models import UserRole
 
 
+# ---------------------------------------------------------------------------
+# RBAC: Zeno-time-flow role hierarchy
+# Super Admin > Organization Manager > Company Manager > Employee
+# ---------------------------------------------------------------------------
+
+class IsSuperAdmin(permissions.BasePermission):
+    """Only Super Admin (Django superuser or super_admin role) has permission."""
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return request.user.is_super_admin()
+
+
+class IsSuperAdminOrReadOnly(permissions.BasePermission):
+    """
+    Allow GET/HEAD/OPTIONS for any authenticated user; allow POST/PUT/PATCH/DELETE only for Super Admin.
+    Use on user list/create so only Super Admin can create users; others can list (filtered by get_queryset).
+    """
+    message = 'Only Super Admin can create or modify users.'
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return request.user.is_super_admin()
+
+
+class IsOrganizationManagerOrAbove(permissions.BasePermission):
+    """Super Admin or user who manages at least one organization."""
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return request.user.is_super_admin() or request.user.is_organization_manager()
+
+
+class IsCompanyManagerOrAbove(permissions.BasePermission):
+    """Super Admin, Org Manager, or user who manages at least one company."""
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return (
+            request.user.is_super_admin()
+            or request.user.is_organization_manager()
+            or request.user.is_company_manager()
+        )
+
+
 class IsOwnerOrReadOnly(permissions.BasePermission):
     """
     Custom permission to only allow owners of an object to edit it.
@@ -28,8 +76,8 @@ class HasRolePermission(permissions.BasePermission):
         if not request.user or not request.user.is_authenticated:
             return False
         
-        # Superusers have all permissions
-        if request.user.is_superuser:
+        # Super Admin (Django superuser OR super_admin role) has all permissions
+        if request.user.is_super_admin():
             return True
         
         # Check if user has any of the required roles
@@ -61,14 +109,14 @@ class IsManagerOrReadOnly(HasRolePermission):
 
 
 class IsSchedulerAdmin(HasRolePermission):
-    """Permission for scheduler app admin access"""
-    required_roles = ['admin', 'super_admin', 'operations_manager']
+    """Permission for scheduler app admin access. RBAC: Super Admin + Org/Company managers (by assignment)."""
+    required_roles = ['admin', 'super_admin', 'operations_manager', 'organization_manager', 'company_manager']
     app_type = 'scheduler'
 
 
 class IsSchedulerManager(HasRolePermission):
-    """Permission for scheduler app manager access"""
-    required_roles = ['admin', 'super_admin', 'operations_manager', 'manager']
+    """Permission for scheduler app manager access."""
+    required_roles = ['admin', 'super_admin', 'operations_manager', 'manager', 'organization_manager', 'company_manager']
     app_type = 'scheduler'
 
 
@@ -80,43 +128,57 @@ class IsCalendarAdmin(HasRolePermission):
 
 class IsEmployeeOrManager(permissions.BasePermission):
     """
-    Permission for employees to access their own data, managers to access their team's data.
+    RBAC: Employees can access own data; Org/Company managers and Super Admin can access by scope.
     """
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
-        
-        if request.user.is_superuser:
+        if request.user.is_super_admin():
             return True
-        
-        # Check if user is an employee or has manager role
-        user_roles = UserRole.objects.filter(user=request.user)
-        role_names = user_roles.values_list('role', flat=True)
-        
-        allowed_roles = ['admin', 'super_admin', 'manager', 'operations_manager', 'employee']
-        return any(role in allowed_roles for role in role_names)
-    
+        # Any user with managed org/company or an employee record can access employee-related views
+        return (
+            request.user.is_organization_manager()
+            or request.user.is_company_manager()
+            or request.user.is_employee_role()
+        )
+
+
+class IsEmployeeOrManagerOrReadOnly(permissions.BasePermission):
+    """
+    Allow GET/HEAD/OPTIONS for any authenticated user (list/retrieve); allow create/update/delete only for managers/employees.
+    Use on EmployeeViewSet so the Employee Management page loads for all users; get_queryset still filters by RBAC.
+    """
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        if request.user.is_super_admin():
+            return True
+        return (
+            request.user.is_organization_manager()
+            or request.user.is_company_manager()
+            or request.user.is_employee_role()
+        )
+
     def has_object_permission(self, request, view, obj):
-        if request.user.is_superuser:
+        if request.method in permissions.SAFE_METHODS:
             return True
-        
-        # If object has an employee field, check if it's the user's employee record
+        if request.user.is_super_admin():
+            return True
+        # Employee object: owner or in scope
+        if hasattr(obj, 'user') and obj.user == request.user:
+            return True
+        if getattr(obj, 'id', None) and obj.id in request.user.get_accessible_employee_ids():
+            return True
+        # TimeClock/Shift etc: employee-owned or in scope
         if hasattr(obj, 'employee') and obj.employee:
             if hasattr(obj.employee, 'user') and obj.employee.user == request.user:
                 return True
-        
-        # If object is an employee, check if it's the user's employee record
-        if hasattr(obj, 'user') and obj.user == request.user:
+            if getattr(obj, 'employee_id', None) and obj.employee_id in request.user.get_accessible_employee_ids():
+                return True
+        if getattr(obj, 'employee_id', None) and obj.employee_id in request.user.get_accessible_employee_ids():
             return True
-        
-        # Managers can access their team's data
-        user_roles = UserRole.objects.filter(user=request.user)
-        role_names = user_roles.values_list('role', flat=True)
-        
-        manager_roles = ['admin', 'super_admin', 'manager', 'operations_manager']
-        if any(role in manager_roles for role in role_names):
-            return True
-        
         return False
 
 
@@ -136,6 +198,35 @@ class IsOwnerOrManager(permissions.BasePermission):
         user_roles = UserRole.objects.filter(user=request.user)
         role_names = user_roles.values_list('role', flat=True)
         
-        manager_roles = ['admin', 'super_admin', 'manager', 'operations_manager']
+        manager_roles = ['admin', 'super_admin', 'manager', 'operations_manager', 'organization_manager', 'company_manager']
         return any(role in manager_roles for role in role_names)
+
+
+# ---------------------------------------------------------------------------
+# RBAC Queryset scoping: use in ViewSet.get_queryset() to enforce data filtering
+# Delegates to centralized rbac module for consistency
+# ---------------------------------------------------------------------------
+
+def get_organization_queryset_for_user(user, base_queryset=None):
+    """Return Organization queryset visible to user. Super Admin: all; Org Manager: assigned only."""
+    from accounts.rbac import scope_organization_queryset
+    return scope_organization_queryset(user, base_queryset)
+
+
+def get_company_queryset_for_user(user, base_queryset=None):
+    """Return Company queryset visible to user. Super Admin: all; Org/Company Manager: by scope."""
+    from accounts.rbac import scope_company_queryset
+    return scope_company_queryset(user, base_queryset)
+
+
+def get_employee_queryset_for_user(user, base_queryset=None):
+    """Return Employee table queryset visible to user. RBAC: Super Admin=all; Managers=by company scope; Employee=self only."""
+    from accounts.rbac import scope_employee_queryset
+    return scope_employee_queryset(user, base_queryset)
+
+
+def get_shift_queryset_for_user(user, base_queryset=None):
+    """Return Shift queryset visible to user. Company Manager: shifts in their companies; Employee: own shifts only."""
+    from accounts.rbac import scope_shift_queryset
+    return scope_shift_queryset(user, base_queryset)
 

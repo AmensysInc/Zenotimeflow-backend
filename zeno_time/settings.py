@@ -1,13 +1,59 @@
 """
 Django settings for zeno_time project.
+Production: set all DB_* and SECRET_KEY via environment; never commit .env.
 """
 
+import os
 from pathlib import Path
-from decouple import config
 from datetime import timedelta
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# ---------------------------------------------------------------------------
+# Environment: django-environ (recommended) or python-decouple / os.environ
+# Load .env from project root when present. Never commit .env; use .env.example as template.
+# ---------------------------------------------------------------------------
+try:
+    import environ
+    env = environ.Env(
+        DEBUG=(bool, False),
+        SECRET_KEY=(str, ''),
+        ALLOWED_HOSTS=(list, []),
+        DB_NAME=(str, 'zenotimeflow_db'),
+        DB_USER=(str, 'root'),
+        DB_PASSWORD=(str, ''),
+        DB_HOST=(str, 'localhost'),
+        DB_PORT=(str, '3306'),
+        CORS_ALLOWED_ORIGINS=(list, []),
+    )
+    env_file = BASE_DIR / '.env'
+    if env_file.exists():
+        env.read_env(str(env_file))
+
+    def config(key, default=None, cast=None):
+        try:
+            val = env(key, default=default)
+        except Exception:
+            val = os.environ.get(key, default)
+        if cast is not None and val is not None:
+            if cast is bool:
+                val = str(val).lower() in ('true', '1', 'yes')
+            else:
+                val = cast(val)
+        return val
+except ImportError:
+    try:
+        from decouple import config
+    except ImportError:
+        def config(key, default=None, cast=None):
+            val = os.environ.get(key, default)
+            if cast is not None and val is not None:
+                if cast is bool:
+                    val = str(val).lower() in ('true', '1', 'yes')
+                else:
+                    val = cast(val)
+            return val
 
 
 # Quick-start development settings - unsuitable for production
@@ -40,7 +86,7 @@ INSTALLED_APPS = [
     'channels',
     
     # Local apps
-    'accounts',
+    'accounts.apps.AccountsConfig',
     'scheduler',
     'calendar_app',
     'tasks',
@@ -81,19 +127,57 @@ WSGI_APPLICATION = 'zeno_time.wsgi.application'
 ASGI_APPLICATION = 'zeno_time.asgi.application'
 
 
-# Database
+# Database Configuration for SaaS Multi-Tenant Architecture
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
+#
+# Production (SaaS): USE_SQLITE=0 → MySQL with zenotimeflow_db
+# Development: USE_SQLITE=1 → SQLite (fallback when MySQL unavailable)
+#
+# MySQL Configuration:
+# - Database: zenotimeflow_db (created via MySQL client)
+# - Engine: InnoDB (ACID compliance, foreign keys, row-level locking)
+# - Charset: utf8mb4 (full Unicode support including emojis)
+# - SQL Mode: STRICT_TRANS_TABLES (data integrity)
+# - Connection pooling: CONN_MAX_AGE (0=close after request, 60+ for production)
+USE_SQLITE = config('USE_SQLITE', default=True, cast=bool)
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': config('DB_NAME', default='zeno_time'),
-        'USER': config('DB_USER', default='postgres'),
-        'PASSWORD': config('DB_PASSWORD', default='postgres'),
-        'HOST': config('DB_HOST', default='localhost'),
-        'PORT': config('DB_PORT', default='5432'),
+if USE_SQLITE:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
-}
+else:
+    # MySQL configuration for production SaaS deployment
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.mysql',
+            'NAME': config('DB_NAME', default='zenotimeflow_db'),
+            'USER': config('DB_USER', default='root'),
+            'PASSWORD': config('DB_PASSWORD', default=''),
+            'HOST': config('DB_HOST', default='localhost'),
+            'PORT': config('DB_PORT', default='3306'),
+            'OPTIONS': {
+                # UTF-8 with full Unicode support (emojis, international chars)
+                'charset': 'utf8mb4',
+                # Connection timeout (seconds)
+                'connect_timeout': 10,
+                # Strict SQL mode for data integrity
+                # Note: NO_AUTO_CREATE_USER removed (deprecated in MySQL 8.0.11+)
+                'init_command': "SET sql_mode='STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
+                # Use InnoDB engine (recommended for Django/FK support)
+                # Note: Table engine is set via migrations; this ensures compatibility
+            },
+            # Connection pooling: 0=close after request (dev), 60-600 for production
+            'CONN_MAX_AGE': config('DB_CONN_MAX_AGE', default=0, cast=int),
+            # Test database isolation (prevents accidental data loss)
+            'TEST': {
+                'CHARSET': 'utf8mb4',
+                'COLLATION': 'utf8mb4_unicode_ci',
+            },
+        }
+    }
 
 
 # Password validation
@@ -183,7 +267,7 @@ SIMPLE_JWT = {
 # CORS Settings
 CORS_ALLOWED_ORIGINS = config(
     'CORS_ALLOWED_ORIGINS',
-    default='http://localhost:5173,http://localhost:8080,http://127.0.0.1:5173,http://127.0.0.1:8080',
+    default='http://localhost:5173,http://localhost:8080,http://localhost:8081,http://127.0.0.1:5173,http://127.0.0.1:8080,http://127.0.0.1:8081',
     cast=lambda v: [s.strip() for s in v.split(',')]
 )
 

@@ -40,6 +40,13 @@ class Organization(models.Model):
     class Meta:
         db_table = 'organizations'
         ordering = ['name']
+        # SaaS Indexes: Optimize role-based queries (Organization Manager, Operations Manager)
+        indexes = [
+            models.Index(fields=['organization_manager'], name='org_manager_idx'),
+            models.Index(fields=['operations_manager'], name='org_ops_manager_idx'),
+            models.Index(fields=['created_by'], name='org_created_by_idx'),
+            models.Index(fields=['created_at'], name='org_created_at_idx'),
+        ]
     
     def __str__(self):
         return self.name
@@ -100,6 +107,14 @@ class Company(models.Model):
         db_table = 'companies'
         ordering = ['name']
         verbose_name_plural = 'companies'
+        # SaaS Indexes: Multi-tenant filtering by organization, role-based access
+        indexes = [
+            models.Index(fields=['organization'], name='company_org_idx'),  # Critical for tenant isolation
+            models.Index(fields=['company_manager'], name='company_manager_idx'),
+            models.Index(fields=['operations_manager'], name='company_ops_manager_idx'),
+            models.Index(fields=['organization', 'name'], name='company_org_name_idx'),  # Composite for filtered lists
+            models.Index(fields=['created_at'], name='company_created_at_idx'),
+        ]
     
     def __str__(self):
         return self.name
@@ -123,6 +138,10 @@ class Department(models.Model):
     class Meta:
         db_table = 'departments'
         ordering = ['name']
+        # SaaS Index: Filter departments by company (multi-tenant)
+        indexes = [
+            models.Index(fields=['company'], name='dept_company_idx'),
+        ]
     
     def __str__(self):
         return f"{self.name} - {self.company.name if self.company else 'No Company'}"
@@ -152,22 +171,31 @@ class ScheduleTeam(models.Model):
     class Meta:
         db_table = 'schedule_teams'
         ordering = ['name']
+        # SaaS Index: Filter teams by company (multi-tenant)
+        indexes = [
+            models.Index(fields=['company'], name='team_company_idx'),
+        ]
     
     def __str__(self):
         return f"{self.name} - {self.company.name}"
 
 
 class Employee(models.Model):
-    """Employee model"""
+    """
+    Dedicated Employee table: one record per user (OneToOne).
+    Links to User (single source of truth for auth) and Company.
+    Employee-specific fields only; created when a user is created with role=employee.
+    """
     STATUS_CHOICES = [
         ('active', 'Active'),
         ('inactive', 'Inactive'),
         ('on_leave', 'On Leave'),
         ('terminated', 'Terminated'),
     ]
-    
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(
+    # OneToOne: one user has at most one Employee record; prevents duplicate employee profiles
+    user = models.OneToOneField(
         User,
         on_delete=models.SET_NULL,
         null=True,
@@ -213,6 +241,16 @@ class Employee(models.Model):
     class Meta:
         db_table = 'employees'
         ordering = ['last_name', 'first_name']
+        # OneToOneField on user enforces at most one Employee per user
+        indexes = [
+            models.Index(fields=['company'], name='employee_company_idx'),  # Critical for tenant isolation
+            models.Index(fields=['user'], name='employee_user_idx'),  # User-Employee relationship
+            models.Index(fields=['status'], name='employee_status_idx'),  # Filter by active/inactive
+            models.Index(fields=['email'], name='employee_email_idx'),  # Email lookups
+            models.Index(fields=['company', 'status'], name='employee_company_status_idx'),  # Composite: active employees per company
+            models.Index(fields=['company', 'department'], name='employee_company_dept_idx'),  # Department filtering
+            models.Index(fields=['hire_date'], name='employee_hire_date_idx'),  # Date range queries
+        ]
     
     @property
     def full_name(self):
@@ -291,6 +329,14 @@ class Shift(models.Model):
     class Meta:
         db_table = 'shifts'
         ordering = ['start_time']
+        # SaaS Indexes: Time-range queries, employee schedules, company filtering
+        indexes = [
+            models.Index(fields=['company'], name='shift_company_idx'),  # Tenant isolation
+            models.Index(fields=['employee'], name='shift_employee_idx'),  # Employee schedule queries
+            models.Index(fields=['start_time', 'end_time'], name='shift_time_range_idx'),  # Time range queries
+            models.Index(fields=['company', 'start_time'], name='shift_company_time_idx'),  # Company schedules
+            models.Index(fields=['status'], name='shift_status_idx'),  # Filter by status
+        ]
     
     def __str__(self):
         return f"{self.employee.full_name if self.employee else 'Unassigned'} - {self.start_time}"
