@@ -476,6 +476,7 @@ class TimeClockViewSet(viewsets.ModelViewSet):
     """Time clock entries. RBAC: Company Manager sees their company's entries; Employee sees own only."""
     serializer_class = TimeClockSerializer
     permission_classes = [permissions.IsAuthenticated]
+    pagination_class = None  # Return plain list for mobile and web
     filterset_fields = ['employee', 'shift']
     ordering_fields = ['clock_in', 'clock_out', 'created_at']
     ordering = ['-clock_in']
@@ -495,13 +496,29 @@ class TimeClockViewSet(viewsets.ModelViewSet):
             qs = qs.filter(clock_out__lte=end_date)
         return qs
     
+    def _ensure_employee_access(self, request, employee_id):
+        """Ensure non-super_admin can only act on their own employee record."""
+        if getattr(request.user, 'is_super_admin', lambda: False)():
+            return
+        allowed = request.user.get_accessible_employee_ids()
+        # Compare as strings (allowed may be UUIDs, employee_id from JSON is string)
+        allowed_str = {str(eid) for eid in (allowed or set())}
+        if employee_id and str(employee_id) not in allowed_str:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('You can only clock in/out for your own employee record.')
+
     @action(detail=False, methods=['post'])
     def clock_in(self, request):
         employee_id = request.data.get('employee_id')
         shift_id = request.data.get('shift_id')
-        
+        if not employee_id:
+            return Response(
+                {'error': 'employee_id is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        self._ensure_employee_access(request, employee_id)
         employee = get_object_or_404(Employee, id=employee_id)
-        shift = get_object_or_404(Shift, id=shift_id) if shift_id else None
+        shift = get_object_or_404(Shift, id=shift_id) if (shift_id and str(shift_id).strip()) else None
         
         # Check if there's an open clock entry
         open_entry = TimeClock.objects.filter(
@@ -529,7 +546,8 @@ class TimeClockViewSet(viewsets.ModelViewSet):
     def clock_out(self, request):
         employee_id = request.data.get('employee_id')
         time_clock_id = request.data.get('time_clock_id')
-        
+        if employee_id:
+            self._ensure_employee_access(request, employee_id)
         if time_clock_id:
             time_clock = get_object_or_404(TimeClock, id=time_clock_id)
         else:

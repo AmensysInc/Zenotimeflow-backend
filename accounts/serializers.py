@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User, Profile, UserRole
 
@@ -65,11 +66,13 @@ class UserSerializer(serializers.ModelSerializer):
             company = obj.managed_companies.first()
             if company:
                 return str(company.id)
-            emp = getattr(obj, 'employee_profile', None)
-            if emp is not None:
-                first_emp = emp.filter(company__isnull=False).first() if hasattr(emp, 'filter') else None
-                if first_emp and getattr(first_emp, 'company_id', None):
-                    return str(first_emp.company_id)
+            # OneToOne reverse: user.employee_profile raises if no Employee; catch it
+            try:
+                emp = obj.employee_profile
+            except Exception:
+                emp = None
+            if emp is not None and getattr(emp, 'company_id', None):
+                return str(emp.company_id)
             return None
         except Exception:
             return None
@@ -119,10 +122,15 @@ class UserCreateSerializer(serializers.ModelSerializer):
         organization_id = attrs.get('organization_id')
         company_id = attrs.get('company_id')
         email = (attrs.get('email') or '').strip().lower()
+        username = (attrs.get('username') or '').strip() or None
+        if not username and email:
+            username = email  # fallback for create()
 
         # Create only once: reject duplicate email (case-insensitive)
         if email and User.objects.filter(email__iexact=email).exists():
             raise serializers.ValidationError({'email': 'A user with this email already exists.'})
+        if username and User.objects.filter(username__iexact=username).exists():
+            raise serializers.ValidationError({'username': 'A user with this username already exists.'})
 
         # Import here to avoid circular import
         from scheduler.models import Organization, Company
@@ -190,8 +198,34 @@ class UserCreateSerializer(serializers.ModelSerializer):
         except Profile.DoesNotExist:
             Profile.objects.create(user=user, email=user.email, full_name=full_name)
 
+        # Employee: create Employee record BEFORE adding UserRole so the post_save signal
+        # (ensure_employee_record_for_employee_role) sees it exists and doesn't create a minimal one without company/PIN.
+        if role == 'employee':
+            from scheduler.models import Company, Employee
+            company = None
+            if company_id:
+                try:
+                    company = Company.objects.get(id=company_id)
+                except Company.DoesNotExist:
+                    pass
+            if full_name:
+                parts = full_name.strip().split(None, 1)
+                emp_first = parts[0] if parts else (user.first_name or user.email.split('@')[0])
+                emp_last = parts[1] if len(parts) > 1 else (user.last_name or '')
+            else:
+                emp_first = user.first_name or user.email.split('@')[0]
+                emp_last = user.last_name or ''
+            Employee.objects.create(
+                user=user,
+                first_name=emp_first,
+                last_name=emp_last,
+                email=user.email,
+                company=company,
+                status='active',
+                employee_pin=employee_pin,
+            )
+
         # Single role per user: remove all roles except super_admin, then add exactly one UserRole for this role.
-        # Employee -> app_type calendar only (no duplicate scheduler+calendar). Others -> one row with scheduler.
         UserRole.objects.filter(user=user).exclude(role='super_admin').delete()
         if role == 'employee':
             UserRole.objects.get_or_create(user=user, role=role, app_type='calendar', defaults={})
@@ -207,48 +241,6 @@ class UserCreateSerializer(serializers.ModelSerializer):
         if role == 'company_manager' and company_id:
             from scheduler.models import Company
             Company.objects.filter(id=company_id).update(company_manager=user)
-        
-        # Employee -> store in employees table with all form fields (full name, email, employee_pin, company)
-        if role == 'employee':
-            from scheduler.models import Company, Employee
-            company = None
-            if company_id:
-                try:
-                    company = Company.objects.get(id=company_id)
-                except Company.DoesNotExist:
-                    pass
-            # Use full_name for employee record; fallback to first_name/last_name or email
-            if full_name:
-                parts = full_name.strip().split(None, 1)
-                emp_first = parts[0] if parts else (user.first_name or user.email.split('@')[0])
-                emp_last = parts[1] if len(parts) > 1 else (user.last_name or '')
-            else:
-                emp_first = user.first_name or user.email.split('@')[0]
-                emp_last = user.last_name or ''
-            obj, created = Employee.objects.get_or_create(
-                user=user,
-                defaults={
-                    'first_name': emp_first,
-                    'last_name': emp_last,
-                    'email': user.email,
-                    'company': company,
-                    'status': 'active',
-                    'employee_pin': employee_pin,
-                }
-            )
-            if not created:
-                update_fields = []
-                if company and not obj.company_id:
-                    obj.company = company
-                    update_fields.extend(['company', 'updated_at'])
-                if employee_pin is not None and obj.employee_pin != employee_pin:
-                    obj.employee_pin = employee_pin
-                    update_fields.extend(['employee_pin', 'updated_at'])
-                if full_name and (obj.first_name != emp_first or obj.last_name != emp_last):
-                    obj.first_name, obj.last_name = emp_first, emp_last
-                    update_fields.extend(['first_name', 'last_name', 'updated_at'])
-                if update_fields:
-                    obj.save(update_fields=list(dict.fromkeys(update_fields)))
         
         return user
     
@@ -295,35 +287,73 @@ class RegisterSerializer(serializers.ModelSerializer):
         return user
 
 
+class EmployeeLoginSerializer(serializers.Serializer):
+    """Login for mobile/clock-in: username + employee PIN. Returns user + employee + JWT. For users with Employee record only."""
+    username = serializers.CharField(required=True, allow_blank=False)
+    pin = serializers.CharField(write_only=True, max_length=10)
+
+    def validate(self, attrs):
+        from scheduler.models import Employee
+        login_id = (attrs.get('username') or '').strip()
+        pin = (attrs.get('pin') or '').strip()
+
+        if not login_id or not pin:
+            raise serializers.ValidationError('Username and PIN are required.')
+
+        UserModel = get_user_model()
+        user = UserModel.objects.select_related('profile').prefetch_related('roles').filter(
+            Q(username__iexact=login_id) | Q(email__iexact=login_id)
+        ).first()
+        if not user:
+            raise serializers.ValidationError('Invalid username or PIN.')
+
+        if not getattr(user, 'is_active', True):
+            raise serializers.ValidationError('User account is disabled.')
+
+        employee = Employee.objects.filter(user=user).first()
+        if not employee:
+            raise serializers.ValidationError(
+                'No employee record for this email. Ask your manager to add you as an employee in User Management.'
+            )
+        if not (employee.employee_pin or str(employee.employee_pin).strip()):
+            raise serializers.ValidationError(
+                'Employee PIN is not set. Ask your manager to set your PIN in User Management (Edit User → Employee PIN).'
+            )
+        if str(employee.employee_pin).strip() != pin:
+            raise serializers.ValidationError('Invalid PIN.')
+
+        attrs['user'] = user
+        attrs['employee'] = employee
+        return attrs
+
+
 class LoginSerializer(serializers.Serializer):
-    """Login by email + password. Returns user + JWT. Works for all roles (Super Admin, Org/Company Manager, Employee)."""
-    email = serializers.EmailField()
+    """Login by username + password (username can be the user's username or email). Returns user + JWT."""
+    username = serializers.CharField(required=True, allow_blank=False)
     password = serializers.CharField(write_only=True)
 
     def validate(self, attrs):
-        email = (attrs.get('email') or '').strip()
+        login_id = (attrs.get('username') or '').strip()
         password = attrs.get('password')
 
-        if not email or not password:
-            raise serializers.ValidationError('Must include email and password')
+        if not login_id or not password:
+            raise serializers.ValidationError('Must include username and password')
 
         UserModel = get_user_model()
-        # Case-insensitive email lookup so Company@x.com and company@x.com both work
-        # Optimize query with select_related/prefetch_related for login response
+        # Look up by username or email (case-insensitive)
         try:
-            user = UserModel.objects.select_related(
-                'profile'
-            ).prefetch_related(
-                'roles', 'managed_organizations', 'managed_companies', 'employee_profile__company'
-            ).get(email__iexact=email)
-        except UserModel.DoesNotExist:
-            # Run default hasher to reduce timing difference (security)
+            user = UserModel.objects.select_related('profile').prefetch_related('roles').filter(
+                Q(username__iexact=login_id) | Q(email__iexact=login_id)
+            ).first()
+        except Exception:
+            user = None
+        if not user:
             UserModel().set_password(password)
-            raise serializers.ValidationError('Invalid email or password')
+            raise serializers.ValidationError('Invalid username or password')
 
         if not user.check_password(password):
             UserModel().set_password(password)
-            raise serializers.ValidationError('Invalid email or password')
+            raise serializers.ValidationError('Invalid username or password')
 
         if not getattr(user, 'is_active', True):
             raise serializers.ValidationError('User account is disabled')

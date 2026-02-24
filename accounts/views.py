@@ -1,3 +1,5 @@
+import logging
+import traceback
 from rest_framework import status, generics, permissions
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -6,12 +8,13 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from .serializers import (
     UserSerializer, UserCreateSerializer, RegisterSerializer, LoginSerializer,
-    ProfileSerializer, UserRoleSerializer
+    EmployeeLoginSerializer, ProfileSerializer, UserRoleSerializer
 )
 from .models import Profile, UserRole
 from .permissions import IsSuperAdminOrReadOnly
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 @api_view(['POST'])
@@ -33,11 +36,47 @@ def register(request):
 
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
-def login(request):
-    """User login (all roles including Super Admin). Returns user + JWT access/refresh."""
-    serializer = LoginSerializer(data=request.data, context={'request': request})
+def employee_login(request):
+    """Mobile/app login: email + employee PIN. Returns user + employee + JWT. For employees only."""
+    serializer = EmployeeLoginSerializer(data=request.data, context={'request': request})
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    user = serializer.validated_data['user']
+    employee = serializer.validated_data['employee']
+    refresh = RefreshToken.for_user(user)
+    # Minimal employee payload (no PIN)
+    employee_data = {
+        'id': str(employee.id),
+        'full_name': employee.full_name,
+        'first_name': employee.first_name,
+        'last_name': employee.last_name,
+        'email': employee.email,
+        'position': getattr(employee, 'position', None) or '',
+        'company_id': str(employee.company_id) if employee.company_id else None,
+        'company_name': employee.company.name if employee.company else None,
+    }
+    return Response({
+        'user': UserSerializer(user).data,
+        'employee': employee_data,
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def login(request):
+    """User login (all roles including Super Admin). Returns user + JWT access/refresh."""
+    print("[LOGIN] POST /api/auth/login/ received", flush=True)
+    logger.info("POST /api/auth/login/ received")
+    try:
+        serializer = LoginSerializer(data=request.data, context={'request': request})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        print("[LOGIN] Error in is_valid():", e, flush=True)
+        traceback.print_exc()
+        return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     user = serializer.validated_data.get('user')
     if not user:
         return Response({'detail': 'Invalid credentials.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -51,20 +90,43 @@ def login(request):
                 'refresh': str(refresh),
             }
         return Response(payload, status=status.HTTP_200_OK)
-    except Exception:
-        refresh = RefreshToken.for_user(user)
-        return Response({
-            'user': {
-                'id': str(user.id),
-                'email': user.email,
-                'username': getattr(user, 'username', None),
-                'is_active': user.is_active,
-                'profile': None,
-                'roles': [],
-            },
-            'access': str(refresh.access_token),
-            'refresh': str(refresh),
-        }, status=status.HTTP_200_OK)
+    except Exception as e:
+        print("[LOGIN] Error building payload:", e, flush=True)
+        traceback.print_exc()
+        logger.exception("Login: building full payload failed: %s", e)
+        try:
+            refresh = RefreshToken.for_user(user)
+            from accounts.rbac import get_user_role
+            return Response({
+                'user': {
+                    'id': str(user.id),
+                    'email': user.email,
+                    'username': getattr(user, 'username', None),
+                    'is_active': user.is_active,
+                    'profile': None,
+                    'roles': [],
+                    'primary_role': get_user_role(user),
+                    'assigned_organization_id': None,
+                    'assigned_company_id': None,
+                },
+                'access': str(refresh.access_token),
+                'refresh': str(refresh),
+            }, status=status.HTTP_200_OK)
+        except Exception as e2:
+            print("[LOGIN] Fallback also failed:", e2, flush=True)
+            traceback.print_exc()
+            logger.exception("Login: fallback payload also failed: %s", e2)
+            return Response(
+                {'detail': 'Login succeeded but building response failed. Check server logs.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def send_welcome_email(request):
+    """Stub: frontend may call this after creating a user. Optionally implement email sending later."""
+    return Response({'message': 'OK'}, status=status.HTTP_200_OK)
 
 
 @api_view(['POST'])
