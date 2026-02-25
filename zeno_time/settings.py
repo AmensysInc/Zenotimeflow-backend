@@ -70,7 +70,12 @@ def _split_list(val):
         return [s.strip() if isinstance(s, str) else str(s).strip() for s in val]
     return [s.strip() for s in str(val).split(',') if s.strip()]
 
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1,192.168.1.235', cast=_split_list)
+_allowed_hosts = config('ALLOWED_HOSTS', default='localhost,127.0.0.1,192.168.1.235', cast=_split_list)
+# Always allow localhost, 127.0.0.1, and waitress.invalid (Waitress / reverse-proxy / same-server calls)
+for _h in ('localhost', '127.0.0.1', 'waitress.invalid'):
+    if _h not in _allowed_hosts:
+        _allowed_hosts.append(_h)
+ALLOWED_HOSTS = _allowed_hosts
 
 
 # Application definition
