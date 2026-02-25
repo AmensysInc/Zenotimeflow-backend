@@ -70,13 +70,20 @@ def _split_list(val):
         return [s.strip() if isinstance(s, str) else str(s).strip() for s in val]
     return [s.strip() for s in str(val).split(',') if s.strip()]
 
-_allowed_hosts = config('ALLOWED_HOSTS', default='localhost,127.0.0.1,192.168.1.235', cast=_split_list)
-# Always allow localhost, 127.0.0.1, and waitress.invalid (Waitress / reverse-proxy / same-server calls)
+_allowed_hosts = config(
+    'ALLOWED_HOSTS',
+    default='localhost,127.0.0.1,zenotimeflow.com,www.zenotimeflow.com',
+    cast=_split_list
+)
+# Always allow internal hosts (Waitress / reverse-proxy / same-server calls)
 for _h in ('localhost', '127.0.0.1', 'waitress.invalid'):
     if _h not in _allowed_hosts:
         _allowed_hosts.append(_h)
 ALLOWED_HOSTS = _allowed_hosts
 
+# IIS + ARR reverse proxy: trust X-Forwarded-Host and X-Forwarded-Proto (HTTPS)
+USE_X_FORWARDED_HOST = True
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # Application definition
 
