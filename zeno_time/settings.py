@@ -65,7 +65,12 @@ SECRET_KEY = config('SECRET_KEY', default='django-insecure-change-this-in-produc
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=True, cast=bool)
 
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1,192.168.1.235', cast=lambda v: [s.strip() for s in v.split(',')])
+def _split_list(val):
+    if isinstance(val, list):
+        return [s.strip() if isinstance(s, str) else str(s).strip() for s in val]
+    return [s.strip() for s in str(val).split(',') if s.strip()]
+
+ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1,192.168.1.235', cast=_split_list)
 
 
 # Application definition
@@ -268,8 +273,8 @@ SIMPLE_JWT = {
 # CORS Settings
 CORS_ALLOWED_ORIGINS = config(
     'CORS_ALLOWED_ORIGINS',
-    default='http://localhost:5173,http://localhost:8080,http://localhost:8081,http://127.0.0.1:5173,http://127.0.0.1:8080,http://127.0.0.1:8081',
-    cast=lambda v: [s.strip() for s in v.split(',')]
+    default='http://localhost:6173,http://localhost:8080,http://localhost:8081,http://127.0.0.1:6173,http://127.0.0.1:8080,http://127.0.0.1:8081',
+    cast=_split_list
 )
 
 CORS_ALLOW_CREDENTIALS = True
