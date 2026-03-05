@@ -1,5 +1,4 @@
 import logging
-import traceback
 from rest_framework import status, generics, permissions
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -67,15 +66,13 @@ def employee_login(request):
 @permission_classes([permissions.AllowAny])
 def login(request):
     """User login (all roles including Super Admin). Returns user + JWT access/refresh."""
-    print("[LOGIN] POST /api/auth/login/ received", flush=True)
     logger.info("POST /api/auth/login/ received")
     try:
         serializer = LoginSerializer(data=request.data, context={'request': request})
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
-        print("[LOGIN] Error in is_valid():", e, flush=True)
-        traceback.print_exc()
+        logger.exception("Login is_valid error: %s", e)
         return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     user = serializer.validated_data.get('user')
     if not user:
@@ -91,8 +88,6 @@ def login(request):
             }
         return Response(payload, status=status.HTTP_200_OK)
     except Exception as e:
-        print("[LOGIN] Error building payload:", e, flush=True)
-        traceback.print_exc()
         logger.exception("Login: building full payload failed: %s", e)
         try:
             refresh = RefreshToken.for_user(user)
@@ -113,8 +108,6 @@ def login(request):
                 'refresh': str(refresh),
             }, status=status.HTTP_200_OK)
         except Exception as e2:
-            print("[LOGIN] Fallback also failed:", e2, flush=True)
-            traceback.print_exc()
             logger.exception("Login: fallback payload also failed: %s", e2)
             return Response(
                 {'detail': 'Login succeeded but building response failed. Check server logs.'},
@@ -182,11 +175,18 @@ class UserListView(generics.ListCreateAPIView):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
     
+    def _user_queryset_optimized(self):
+        """Base User queryset with select_related/prefetch_related to avoid N+1 in UserSerializer."""
+        return User.objects.select_related('profile').prefetch_related(
+            'roles', 'managed_organizations', 'managed_companies', 'employee_profile'
+        )
+
     def get_queryset(self):
         user = self.request.user
+        base = self._user_queryset_optimized()
         # Super Admin sees all users; others are filtered by RBAC scope
         if user.is_super_admin():
-            return User.objects.all().order_by('email')
+            return base.order_by('email')
         # RBAC filtering for non-super-admin users
         from scheduler.models import Organization, Company, Employee
         user_ids = {user.id}
@@ -212,9 +212,9 @@ class UserListView(generics.ListCreateAPIView):
         # Employees see only themselves (unless they're also managers)
         emp = Employee.objects.filter(user=user).first()
         if emp and not (user.is_organization_manager() or user.is_company_manager()):
-            return User.objects.filter(id=user.id).order_by('email')
+            return base.filter(id=user.id).order_by('email')
         if user_ids:
-            return User.objects.filter(id__in=user_ids).order_by('email')
+            return base.filter(id__in=user_ids).order_by('email')
         return User.objects.none()
     
     def perform_create(self, serializer):
@@ -243,10 +243,13 @@ class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def get_queryset(self):
         user = self.request.user
+        base = User.objects.select_related('profile').prefetch_related(
+            'roles', 'managed_organizations', 'managed_companies', 'employee_profile'
+        )
         if user.is_super_admin():
-            return User.objects.all()
+            return base
         if user.is_employee_role() and not (user.is_organization_manager() or user.is_company_manager()):
-            return User.objects.filter(id=user.id)
+            return base.filter(id=user.id)
         from scheduler.models import Organization, Company, Employee
         user_ids = {user.id}
         for org in Organization.objects.filter(organization_manager=user):
@@ -264,7 +267,7 @@ class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
             for e in c.employees.filter(user__isnull=False):
                 if e.user_id:
                     user_ids.add(e.user_id)
-        return User.objects.filter(id__in=user_ids)
+        return base.filter(id__in=user_ids)
 
 
 def _get_profile_queryset(request):

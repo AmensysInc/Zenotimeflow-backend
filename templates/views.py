@@ -1,5 +1,6 @@
 from rest_framework import viewsets, status, permissions
 from rest_framework.response import Response
+from zeno_time.cache_mixins import CacheListResponseMixin
 from .models import LearningTemplate, TemplateAssignment
 from .serializers import LearningTemplateSerializer, LearningTemplateListSerializer, TemplateAssignmentSerializer
 
@@ -14,7 +15,7 @@ def is_template_admin(user):
     return bool(role_names & {'super_admin', 'operations_manager', 'manager'})
 
 
-class LearningTemplateViewSet(viewsets.ModelViewSet):
+class LearningTemplateViewSet(CacheListResponseMixin, viewsets.ModelViewSet):
     serializer_class = LearningTemplateSerializer
     permission_classes = [permissions.IsAuthenticated]
     filterset_fields = ['created_by']

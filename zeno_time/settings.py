@@ -114,6 +114,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'django.middleware.gzip.GZipMiddleware',  # Compress responses for faster transfer
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -196,6 +197,20 @@ else:
             },
         }
     }
+
+# Cache (for API response caching – list endpoints that don't change often)
+# https://docs.djangoproject.com/en/5.0/topics/cache/
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'zeno-api-cache',
+        'OPTIONS': {
+            'MAX_ENTRIES': 500,
+        },
+    }
+}
+# Optional: in production set CACHE_TIMEOUT_API (seconds) via env; default 60
+CACHE_TIMEOUT_API = config('CACHE_TIMEOUT_API', default=60, cast=int)
 
 
 # Password validation
@@ -304,11 +319,14 @@ CORS_ALLOW_HEADERS = [
 ]
 
 # Channels Configuration (for WebSocket/real-time features)
+# Docker: set REDIS_HOST=redis, REDIS_PORT=6379
+_redis_host = config('REDIS_HOST', default='127.0.0.1')
+_redis_port = config('REDIS_PORT', default=6379, cast=int)
 CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels_redis.core.RedisChannelLayer',
         'CONFIG': {
-            "hosts": [('127.0.0.1', 6379)],
+            "hosts": [(_redis_host, _redis_port)],
         },
     },
 }

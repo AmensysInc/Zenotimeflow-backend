@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from django.utils import timezone
 from django.db.models import Q, Sum
 from django.shortcuts import get_object_or_404
+from zeno_time.cache_mixins import CacheListResponseMixin
 from accounts.permissions import (
     IsSchedulerAdmin, IsSchedulerManager, IsEmployeeOrManager, IsEmployeeOrManagerOrReadOnly,
     IsOwnerOrManager, IsCompanyManagerOrAbove,
@@ -25,7 +26,7 @@ from .serializers import (
 )
 
 
-class OrganizationViewSet(viewsets.ModelViewSet):
+class OrganizationViewSet(CacheListResponseMixin, viewsets.ModelViewSet):
     """Organizations. RBAC: Super Admin sees all and can create; Organization Manager sees only assigned orgs."""
     serializer_class = OrganizationSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -51,7 +52,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
 
-class CompanyViewSet(viewsets.ModelViewSet):
+class CompanyViewSet(CacheListResponseMixin, viewsets.ModelViewSet):
     """
     Companies (TASK 4).
     - Super Admin: sees all companies
@@ -95,7 +96,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
 
-class DepartmentViewSet(viewsets.ModelViewSet):
+class DepartmentViewSet(CacheListResponseMixin, viewsets.ModelViewSet):
     """Departments. RBAC: filtered by companies the user can access."""
     serializer_class = DepartmentSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -132,7 +133,7 @@ class ScheduleTeamViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
 
-class EmployeeViewSet(viewsets.ModelViewSet):
+class EmployeeViewSet(CacheListResponseMixin, viewsets.ModelViewSet):
     """
     Employees are stored in the scheduler Employee table (employees), not in user_roles.
     List/retrieve from employees table only; RBAC filters by managed companies / self.
@@ -611,7 +612,7 @@ class TimeClockViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
-class ScheduleTemplateViewSet(viewsets.ModelViewSet):
+class ScheduleTemplateViewSet(CacheListResponseMixin, viewsets.ModelViewSet):
     """Schedule templates. RBAC: filtered by companies the user can access."""
     serializer_class = ScheduleTemplateSerializer
     permission_classes = [permissions.IsAuthenticated]
