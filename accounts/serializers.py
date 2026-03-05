@@ -1,8 +1,19 @@
+import re
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User, Profile, UserRole
+
+
+def normalize_phone_10(value):
+    """Strip non-digits and return last 10 digits, or None if fewer than 10 digits."""
+    if value is None:
+        return None
+    digits = re.sub(r'\D', '', str(value).strip())
+    if len(digits) < 10:
+        return None
+    return digits[-10:] if len(digits) > 10 else digits
 
 
 class UserRoleSerializer(serializers.ModelSerializer):
@@ -109,12 +120,14 @@ class UserCreateSerializer(serializers.ModelSerializer):
     company_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
     # Employee-only: stored in employees table when role=employee
     employee_pin = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=10)
+    # Profile: 10-digit phone (no country code); stored in Profile.mobile_number
+    mobile_number = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=20)
 
     class Meta:
         model = User
         fields = [
             'email', 'username', 'password', 'first_name', 'last_name',
-            'is_active', 'full_name', 'role', 'organization_id', 'company_id', 'employee_pin'
+            'is_active', 'full_name', 'role', 'organization_id', 'company_id', 'employee_pin', 'mobile_number'
         ]
     
     def validate(self, attrs):
@@ -177,6 +190,8 @@ class UserCreateSerializer(serializers.ModelSerializer):
         organization_id = validated_data.pop('organization_id', None)
         company_id = validated_data.pop('company_id', None)
         employee_pin = (validated_data.pop('employee_pin', None) or '').strip() or None
+        mobile_number_raw = (validated_data.pop('mobile_number', None) or '').strip() or None
+        mobile_number = normalize_phone_10(mobile_number_raw) if mobile_number_raw else None
         username = validated_data.pop('username', None) or validated_data['email']
         
         # create_user() hashes password; create user only once
@@ -189,14 +204,22 @@ class UserCreateSerializer(serializers.ModelSerializer):
             is_active=validated_data.get('is_active', True)
         )
 
-        # Profile: signal already created it; just update full_name
+        # Profile: signal already created it; just update full_name and mobile_number
         try:
             profile = user.profile
+            update_fields = ['updated_at']
             if full_name:
                 profile.full_name = full_name
-                profile.save(update_fields=['full_name', 'updated_at'])
+                update_fields.append('full_name')
+            if mobile_number is not None:
+                profile.mobile_number = mobile_number
+                update_fields.append('mobile_number')
+            profile.save(update_fields=update_fields)
         except Profile.DoesNotExist:
-            Profile.objects.create(user=user, email=user.email, full_name=full_name)
+            Profile.objects.create(
+                user=user, email=user.email, full_name=full_name,
+                mobile_number=mobile_number or ''
+            )
 
         # Employee: create Employee record BEFORE adding UserRole so the post_save signal
         # (ensure_employee_record_for_employee_role) sees it exists and doesn't create a minimal one without company/PIN.
@@ -253,10 +276,11 @@ class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=8)
     password_confirm = serializers.CharField(write_only=True, min_length=8)
     full_name = serializers.CharField(write_only=True, required=False)
+    mobile_number = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=20)
     
     class Meta:
         model = User
-        fields = ['email', 'username', 'password', 'password_confirm', 'full_name']
+        fields = ['email', 'username', 'password', 'password_confirm', 'full_name', 'mobile_number']
     
     def validate(self, attrs):
         if attrs['password'] != attrs['password_confirm']:
@@ -266,6 +290,8 @@ class RegisterSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data.pop('password_confirm')
         full_name = validated_data.pop('full_name', None)
+        mobile_number_raw = (validated_data.pop('mobile_number', None) or '').strip() or None
+        mobile_number = normalize_phone_10(mobile_number_raw) if mobile_number_raw else None
         username = validated_data.pop('username', None) or validated_data['email']
 
         user = User.objects.create_user(
@@ -275,14 +301,21 @@ class RegisterSerializer(serializers.ModelSerializer):
         )
 
         # Profile and default UserRole are created by post_save signal (accounts.signals).
-        # Only update profile full_name if provided.
-        if full_name:
-            try:
-                profile = user.profile
+        try:
+            profile = user.profile
+            update_fields = ['updated_at']
+            if full_name:
                 profile.full_name = full_name
-                profile.save(update_fields=['full_name', 'updated_at'])
-            except Profile.DoesNotExist:
-                Profile.objects.create(user=user, email=user.email, full_name=full_name)
+                update_fields.append('full_name')
+            if mobile_number is not None:
+                profile.mobile_number = mobile_number
+                update_fields.append('mobile_number')
+            profile.save(update_fields=update_fields)
+        except Profile.DoesNotExist:
+            Profile.objects.create(
+                user=user, email=user.email, full_name=full_name or '',
+                mobile_number=mobile_number or ''
+            )
 
         return user
 
@@ -304,6 +337,15 @@ class EmployeeLoginSerializer(serializers.Serializer):
         user = UserModel.objects.select_related('profile').prefetch_related('roles').filter(
             Q(username__iexact=login_id) | Q(email__iexact=login_id)
         ).first()
+        if not user:
+            phone_10 = normalize_phone_10(login_id)
+            if phone_10:
+                for p in Profile.objects.select_related('user').prefetch_related('user__roles').filter(
+                    mobile_number__isnull=False
+                ).exclude(mobile_number=''):
+                    if normalize_phone_10(p.mobile_number) == phone_10:
+                        user = p.user
+                        break
         if not user:
             raise serializers.ValidationError('Invalid username or PIN.')
 
@@ -347,6 +389,16 @@ class LoginSerializer(serializers.Serializer):
             ).first()
         except Exception:
             user = None
+        # If not found, try 10-digit phone (no country code; users enter digits only)
+        if not user:
+            phone_10 = normalize_phone_10(login_id)
+            if phone_10:
+                for p in Profile.objects.select_related('user').prefetch_related('user__roles').filter(
+                    mobile_number__isnull=False
+                ).exclude(mobile_number=''):
+                    if normalize_phone_10(p.mobile_number) == phone_10:
+                        user = p.user
+                        break
         if not user:
             UserModel().set_password(password)
             raise serializers.ValidationError('Invalid username or password')

@@ -26,8 +26,9 @@ from .serializers import (
 )
 
 
-class OrganizationViewSet(CacheListResponseMixin, viewsets.ModelViewSet):
-    """Organizations. RBAC: Super Admin sees all and can create; Organization Manager sees only assigned orgs."""
+class OrganizationViewSet(viewsets.ModelViewSet):
+    """Organizations. RBAC: Super Admin sees all and can create; Organization Manager sees only assigned orgs.
+    List cache disabled so create/delete/update are visible immediately."""
     serializer_class = OrganizationSerializer
     permission_classes = [permissions.IsAuthenticated]
     filterset_fields = ['organization_manager', 'operations_manager']
@@ -52,7 +53,7 @@ class OrganizationViewSet(CacheListResponseMixin, viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
 
-class CompanyViewSet(CacheListResponseMixin, viewsets.ModelViewSet):
+class CompanyViewSet(viewsets.ModelViewSet):
     """
     Companies (TASK 4).
     - Super Admin: sees all companies
@@ -585,6 +586,26 @@ class TimeClockViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(time_clock)
         return Response(serializer.data)
     
+    def perform_update(self, serializer):
+        """Allow super_admin to edit clock_in/clock_out; recalc total_hours and overtime_hours."""
+        from rest_framework.exceptions import PermissionDenied
+        data = serializer.validated_data
+        if 'clock_in' in data or 'clock_out' in data:
+            if not self.request.user.is_super_admin():
+                raise PermissionDenied('Only super admin can edit clock in/out times.')
+        instance = serializer.save()
+        if 'clock_in' in data or 'clock_out' in data:
+            if instance.clock_in and instance.clock_out:
+                delta = instance.clock_out - instance.clock_in
+                total_seconds = delta.total_seconds()
+                break_seconds = 0
+                if instance.break_start and instance.break_end:
+                    break_seconds = (instance.break_end - instance.break_start).total_seconds()
+                total_hours = round((total_seconds - break_seconds) / 3600, 2)
+                instance.total_hours = total_hours
+                instance.overtime_hours = round(max(0, total_hours - 8), 2)
+                instance.save(update_fields=['total_hours', 'overtime_hours'])
+
     @action(detail=True, methods=['post'])
     def start_break(self, request, pk=None):
         time_clock = self.get_object()
