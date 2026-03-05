@@ -7,9 +7,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install system deps for MySQL client and Pillow
+# Install system deps for MySQL client (mysqlclient) and Pillow
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    default-libmysqlclient-dev build-essential \
+    pkg-config \
+    default-libmysqlclient-dev \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
