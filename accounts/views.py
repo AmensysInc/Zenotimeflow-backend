@@ -308,11 +308,31 @@ def _get_profile_queryset(request):
 
 
 class ProfileDetailView(generics.RetrieveUpdateAPIView):
-    """GET/PATCH profile by profile id or user id. RBAC: same scope as user list; only Super Admin can update."""
+    """GET/PATCH profile by profile id or user id. RBAC: same scope as user list; only Super Admin can update.
+    On update: sync Profile.full_name -> User.first_name/last_name -> Employee (so Employee Directory shows correct names)."""
     serializer_class = ProfileSerializer
     permission_classes = [permissions.IsAuthenticated, IsSuperAdminOrReadOnly]
     lookup_url_kwarg = 'pk'
     lookup_field = 'id'
+
+    def perform_update(self, serializer):
+        profile = serializer.save()
+        full = (profile.full_name or '').strip()
+        if full:
+            parts = full.split(None, 1)
+            first = parts[0]
+            last = parts[1] if len(parts) > 1 else ''
+        else:
+            first, last = '', ''
+        # Sync User
+        profile.user.first_name = first
+        profile.user.last_name = last
+        profile.user.save(update_fields=['first_name', 'last_name'])
+        # Sync linked Employee so Employee Directory shows correct names
+        from scheduler.models import Employee
+        emp = Employee.objects.filter(user=profile.user).first()
+        if emp is not None:
+            Employee.objects.filter(pk=emp.pk).update(first_name=first, last_name=last, email=profile.user.email)
 
     def get_queryset(self):
         return _get_profile_queryset(self.request)
