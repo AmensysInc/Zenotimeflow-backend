@@ -15,12 +15,13 @@ from accounts.permissions import (
 )
 from .models import (
     Organization, Company, Department, ScheduleTeam, Employee,
-    Shift, ShiftReplacementRequest, EmployeeAvailability,
+    Shift, ShiftTask, ShiftReplacementRequest, EmployeeAvailability,
     TimeClock, ScheduleTemplate, AppSettings
 )
 from .serializers import (
     OrganizationSerializer, CompanySerializer, DepartmentSerializer,
     ScheduleTeamSerializer, EmployeeSerializer, ShiftSerializer,
+    ShiftTaskSerializer,
     ShiftReplacementRequestSerializer, EmployeeAvailabilitySerializer,
     TimeClockSerializer, ScheduleTemplateSerializer, AppSettingsSerializer
 )
@@ -204,7 +205,7 @@ class ShiftViewSet(viewsets.ModelViewSet):
         """Return shifts visible to user with optimized queries."""
         queryset = get_shift_queryset_for_user(self.request.user).select_related(
             'employee', 'employee__user', 'company', 'department', 'team', 'created_by'
-        ).prefetch_related('employee__company')
+        ).prefetch_related('employee__company', 'shift_tasks')
         
         # Filter by date range if provided
         start_date = self.request.query_params.get('start_date')
@@ -276,6 +277,7 @@ class ShiftViewSet(viewsets.ModelViewSet):
                 if not can_create_shift(self.request.user, company_id_str):
                     raise PermissionDenied('You do not have permission to create shifts for this company.')
         
+        serializer.validated_data['is_published'] = False
         serializer.save(created_by=self.request.user)
     
     def perform_update(self, serializer):
@@ -399,6 +401,78 @@ class ShiftViewSet(viewsets.ModelViewSet):
         shift.save()
         serializer = self.get_serializer(shift)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['post'])
+    def publish_week(self, request):
+        """Publish shifts for a company in a date range. Employees will then see these shifts."""
+        from accounts.rbac import can_create_shift, get_manager_company
+        from rest_framework.exceptions import ValidationError, PermissionDenied
+
+        company_id = request.data.get('company')
+        start_date = request.data.get('start_date')
+        end_date = request.data.get('end_date')
+        if not company_id or not start_date or not end_date:
+            raise ValidationError('company, start_date, and end_date are required.')
+        company_id_str = str(company_id)
+        if not can_create_shift(request.user, company_id_str):
+            raise PermissionDenied('You do not have permission to publish shifts for this company.')
+        shift_qs = get_shift_queryset_for_user(request.user).filter(
+            company_id=company_id,
+            start_time__date__gte=start_date[:10] if isinstance(start_date, str) else start_date,
+            end_time__date__lte=end_date[:10] if isinstance(end_date, str) else end_date,
+        )
+        updated = shift_qs.update(is_published=True)
+        return Response({'published': updated, 'message': f'{updated} shifts published.'})
+
+
+class ShiftTaskViewSet(viewsets.ModelViewSet):
+    """Tasks/responsibilities for a shift. List/create/delete. User must have access to the shift.
+    Creates a CalendarEvent for the employee so shift tasks appear in Calendar and Tasks."""
+    serializer_class = ShiftTaskSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filterset_fields = ['shift']
+
+    def get_queryset(self):
+        shift_qs = get_shift_queryset_for_user(self.request.user)
+        return ShiftTask.objects.filter(shift__in=shift_qs).select_related('shift', 'shift__employee__user')
+
+    def perform_create(self, serializer):
+        shift = serializer.validated_data['shift']
+        shift_qs = get_shift_queryset_for_user(self.request.user)
+        if not shift_qs.filter(pk=shift.pk).exists():
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('You do not have access to this shift.')
+        from accounts.rbac import can_modify_shift
+        if not self.request.user.is_super_admin() and not can_modify_shift(self.request.user, str(shift.id)):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('You cannot add tasks to this shift.')
+        shift_task = serializer.save()
+        # Sync to CalendarEvent so employee sees it in Calendar and Tasks
+        emp = shift.employee
+        if emp and emp.user_id:
+            from datetime import timedelta
+            from calendar_app.models import CalendarEvent
+            start = shift.start_time
+            end = shift.end_time if shift.end_time else (start + timedelta(hours=1) if start else timezone.now())
+            try:
+                evt = CalendarEvent.objects.create(
+                    user_id=emp.user_id,
+                    title=shift_task.title,
+                    description='Shift responsibility (from schedule)',
+                    start_time=start,
+                    end_time=end,
+                    event_type='task',
+                )
+                ShiftTask.objects.filter(pk=shift_task.pk).update(calendar_event_id=evt.id)
+            except Exception:
+                pass
+
+    def perform_destroy(self, instance):
+        cal_id = instance.calendar_event_id
+        instance.delete()
+        if cal_id:
+            from calendar_app.models import CalendarEvent
+            CalendarEvent.objects.filter(id=cal_id).delete()
 
 
 class ShiftReplacementRequestViewSet(viewsets.ModelViewSet):

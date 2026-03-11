@@ -311,6 +311,7 @@ class Shift(models.Model):
     break_minutes = models.IntegerField(default=0)
     hourly_rate = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='scheduled')
+    is_published = models.BooleanField(default=False, help_text='False=draft; employees only see published shifts')
     notes = models.TextField(null=True, blank=True)
     is_missed = models.BooleanField(default=False)
     missed_at = models.DateTimeField(null=True, blank=True)
@@ -340,6 +341,28 @@ class Shift(models.Model):
     
     def __str__(self):
         return f"{self.employee.full_name if self.employee else 'Unassigned'} - {self.start_time}"
+
+
+class ShiftTask(models.Model):
+    """Task/responsibility assigned to a shift. Shown to employee when they clock in.
+    Syncs to CalendarEvent so employee sees it in Calendar and Tasks."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    shift = models.ForeignKey(
+        Shift,
+        on_delete=models.CASCADE,
+        related_name='shift_tasks'
+    )
+    title = models.CharField(max_length=255)
+    order = models.PositiveSmallIntegerField(default=0)
+    calendar_event_id = models.UUIDField(null=True, blank=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'shift_tasks'
+        ordering = ['order', 'created_at']
+
+    def __str__(self):
+        return f"{self.title} (shift {self.shift_id})"
 
 
 class ShiftReplacementRequest(models.Model):

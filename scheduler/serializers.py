@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Organization, Company, Department, ScheduleTeam, Employee,
-    Shift, ShiftReplacementRequest, EmployeeAvailability,
+    Shift, ShiftTask, ShiftReplacementRequest, EmployeeAvailability,
     TimeClock, ScheduleTemplate, AppSettings
 )
 from accounts.models import User
@@ -170,13 +170,47 @@ class EmployeeSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class ShiftTaskSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ShiftTask
+        fields = ['id', 'shift', 'title', 'order', 'calendar_event_id', 'created_at']
+        read_only_fields = ['id', 'calendar_event_id', 'created_at']
+
+
 class ShiftSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source='employee.full_name', read_only=True)
     replacement_employee_name = serializers.CharField(source='replacement_employee.full_name', read_only=True)
     company_name = serializers.CharField(source='company.name', read_only=True)
     department_name = serializers.CharField(source='department.name', read_only=True)
     team_name = serializers.CharField(source='team.name', read_only=True)
-    
+    shift_tasks = ShiftTaskSerializer(many=True, read_only=True)
+
+    def validate(self, attrs):
+        # Merge with instance for PATCH so we validate full data
+        employee = attrs.get('employee')
+        start_time = attrs.get('start_time')
+        end_time = attrs.get('end_time')
+        if self.instance:
+            if employee is None:
+                employee = self.instance.employee
+            if start_time is None:
+                start_time = self.instance.start_time
+            if end_time is None:
+                end_time = self.instance.end_time
+        if employee and start_time and end_time:
+            qs = Shift.objects.filter(
+                employee=employee,
+                start_time=start_time,
+                end_time=end_time,
+            ).exclude(status='cancelled')
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError(
+                    'This employee is already scheduled for this time slot. Duplicate shifts are not allowed.'
+                )
+        return attrs
+
     class Meta:
         model = Shift
         fields = [
@@ -184,9 +218,10 @@ class ShiftSerializer(serializers.ModelSerializer):
             'replacement_employee_name', 'company', 'company_name',
             'department', 'department_name', 'team', 'team_name',
             'start_time', 'end_time', 'break_minutes', 'hourly_rate',
-            'status', 'notes', 'is_missed', 'missed_at',
+            'status', 'is_published', 'notes', 'is_missed', 'missed_at',
             'replacement_approved_at', 'replacement_started_at',
-            'created_by', 'created_at', 'updated_at'
+            'created_by', 'created_at', 'updated_at',
+            'shift_tasks',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 

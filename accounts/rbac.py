@@ -216,14 +216,18 @@ def scope_employee_queryset(user, queryset: Optional[QuerySet] = None):
 
 
 def scope_shift_queryset(user, queryset: Optional[QuerySet] = None):
-    """Return Shift queryset visible to user. Company Manager: shifts in their companies; Employee: own shifts only."""
+    """Return Shift queryset visible to user. Managers: shifts in scope (incl. drafts); employees: own shifts, published only."""
     from scheduler.models import Shift
     qs = queryset if queryset is not None else Shift.objects.all()
     if is_super_admin(user):
         return qs
     company_ids = get_managed_company_ids(user)
     emp_ids = get_accessible_employee_ids(user)
-    return qs.filter(Q(company_id__in=company_ids) | Q(employee_id__in=emp_ids)).distinct()
+    qs = qs.filter(Q(company_id__in=company_ids) | Q(employee_id__in=emp_ids)).distinct()
+    # Pure employees (not managers) only see published shifts
+    if is_employee(user) and not is_organization_manager(user) and not is_company_manager(user):
+        qs = qs.filter(is_published=True)
+    return qs
 
 
 # ---------------------------------------------------------------------------

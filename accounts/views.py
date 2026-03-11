@@ -241,6 +241,18 @@ class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated, IsSuperAdminOrReadOnly]
 
+    def perform_update(self, serializer):
+        user = serializer.save()
+        # Sync User first_name, last_name, email to linked Employee so Employees and Schedule show correct names
+        from scheduler.models import Employee
+        emp = Employee.objects.filter(user=user).first()
+        if emp is not None:
+            Employee.objects.filter(pk=emp.pk).update(
+                first_name=user.first_name or '',
+                last_name=user.last_name or '',
+                email=user.email,
+            )
+
     def get_queryset(self):
         user = self.request.user
         base = User.objects.select_related('profile').prefetch_related(
